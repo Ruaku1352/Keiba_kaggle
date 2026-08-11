@@ -27,6 +27,11 @@ from . import config, leakfree
 
 # 3連単らしい列名（「3連単」「三連単」「trifecta」の表記ゆれを吸収）
 _TRIFECTA = re.compile(r"(3連単|３連単|三連単|trifecta)", re.IGNORECASE)
+# 3連複らしい列名
+_TRIO = re.compile(r"(3連複|３連複|三連複|trio)", re.IGNORECASE)
+
+# 券種名 -> 列名パターン
+KIND_PATTERNS = {"3連単": _TRIFECTA, "3連複": _TRIO}
 # 金額らしい列名
 _PAYOUT = re.compile(r"(払戻|配当|払い戻し|payout|refund)")
 # オッズらしい列名（払戻が無い場合の代替。オッズ×100 が払戻に相当する）
@@ -44,63 +49,89 @@ def describe_odds_columns(path: str | None = None, nrows: int = 5) -> pd.DataFra
     return pd.DataFrame({
         "column": head.columns,
         "3連単らしい": [bool(_TRIFECTA.search(str(c))) for c in head.columns],
+        "3連複らしい": [bool(_TRIO.search(str(c))) for c in head.columns],
         "金額らしい": [bool(_PAYOUT.search(str(c))) for c in head.columns],
         "サンプル": [head[c].iloc[0] if len(head) else None for c in head.columns],
     })
 
 
-def _guess_payout_column(columns) -> str:
-    """3連単の払戻列を推測する。"""
-    trifecta = [c for c in columns if _TRIFECTA.search(str(c))]
-    if not trifecta:
+def _guess_payout_column(columns, kind: str = "3連単") -> str:
+    """指定した券種の払戻列を推測する。"""
+    pattern = KIND_PATTERNS[kind]
+    candidates = [c for c in columns if pattern.search(str(c))]
+    if kind == "3連単":
+        # 「3連複」を「3連単」と誤認しないよう、複の方は除外しておく
+        candidates = [c for c in candidates if not _TRIO.search(str(c))]
+    if not candidates:
         raise KeyError(
-            "3連単らしい列が見つかりません。"
+            f"{kind}らしい列が見つかりません。"
             "describe_odds_columns() で列名を確認し、payout_col= で明示してください"
         )
-    # 「3連単」かつ「払戻/配当」を最優先、次点でオッズ列
-    for pattern in (_PAYOUT, _ODDS):
-        hit = [c for c in trifecta if pattern.search(str(c))]
+    # 「払戻/配当」を最優先、次点でオッズ列
+    for sub in (_PAYOUT, _ODDS):
+        hit = [c for c in candidates if sub.search(str(c))]
         if hit:
             return hit[0]
     # 数字だけが入っていそうな列にフォールバック
-    return trifecta[0]
+    return candidates[0]
+
+
+def _to_payout(raw: pd.DataFrame, column: str, is_odds: bool | None) -> pd.Series:
+    """払戻列を数値に変換する（カンマ・「円」を除去、オッズなら100倍）。"""
+    value = pd.to_numeric(
+        raw[column].astype(str).str.replace(r"[,円]", "", regex=True),
+        errors="coerce",
+    )
+    if is_odds is None:
+        # 3連単の払戻は普通「数百〜数百万円」。中央値が3桁未満ならオッズ表記とみなす。
+        is_odds = bool(_ODDS.search(str(column))) and (value.median() < 1000)
+    if is_odds:
+        value = value * 100  # オッズ（倍率）を100円あたりの払戻に直す
+    return value.astype("float64")
+
+
+def load_payouts(path: str | None = None, kinds: tuple[str, ...] = ("3連単", "3連複"),
+                 columns: dict[str, str] | None = None,
+                 is_odds: bool | None = None) -> pd.DataFrame:
+    """レースIDごとの払戻（100円あたり）を券種ごとに返す。
+
+    Parameters
+    ----------
+    kinds   : 取り出す券種。既定は3連単と3連複。
+    columns : {券種: 列名} で明示指定できる。省略した券種は自動推測。
+              自動推測に失敗した券種は、例外にせず単にスキップする
+              （3連複の列がないデータでも3連単だけで動くようにするため）。
+
+    戻り値の列: レースID, 3連単払戻, 3連複払戻（見つかったものだけ）
+    """
+    path = path or config.ODDS_CSV
+    raw = pd.read_csv(path, low_memory=False)
+    id_col = "レースID" if "レースID" in raw.columns else raw.columns[0]
+    columns = columns or {}
+
+    out = pd.DataFrame({"レースID": leakfree.normalize_id(raw[id_col])})
+    for kind in kinds:
+        col = columns.get(kind)
+        if col is None:
+            try:
+                col = _guess_payout_column(raw.columns, kind)
+            except KeyError:
+                continue  # その券種の列がないだけなので無視する
+        out[f"{kind}払戻"] = _to_payout(raw, col, is_odds)
+
+    value_cols = [c for c in out.columns if c != "レースID"]
+    if not value_cols:
+        raise KeyError(
+            "払戻列が1つも見つかりません。describe_odds_columns() で列名を確認してください"
+        )
+    return out.dropna(subset=value_cols, how="all").drop_duplicates(subset="レースID")
 
 
 def load_trifecta_payout(path: str | None = None, payout_col: str | None = None,
                          is_odds: bool | None = None) -> pd.DataFrame:
-    """レースIDごとの3連単払戻（100円あたり）を返す。
-
-    Parameters
-    ----------
-    payout_col : 払戻列の名前。省略時は自動推測。
-    is_odds    : その列が「払戻金」ではなく「オッズ（倍率）」の場合 True。
-                 省略時は列名と値の大きさから判定する。
-
-    戻り値の列: レースID, 3連単払戻
-    """
-    path = path or config.ODDS_CSV
-    raw = pd.read_csv(path, low_memory=False)
-
-    id_col = "レースID" if "レースID" in raw.columns else raw.columns[0]
-    payout_col = payout_col or _guess_payout_column(raw.columns)
-
-    value = pd.to_numeric(
-        raw[payout_col].astype(str).str.replace(r"[,円]", "", regex=True),
-        errors="coerce",
-    )
-
-    if is_odds is None:
-        # 3連単の払戻は普通「数百〜数百万円」。中央値が3桁未満ならオッズ表記とみなす。
-        median = value.median()
-        is_odds = bool(_ODDS.search(str(payout_col))) and (median < 1000)
-    if is_odds:
-        value = value * 100  # オッズ（倍率）を100円あたりの払戻に直す
-
-    out = pd.DataFrame({
-        "レースID": leakfree.normalize_id(raw[id_col]),
-        "3連単払戻": value.astype("float64"),
-    })
-    return out.dropna(subset=["3連単払戻"]).drop_duplicates(subset="レースID")
+    """レースIDごとの3連単払戻だけを返す（load_payouts の3連単版）。"""
+    columns = {"3連単": payout_col} if payout_col else None
+    return load_payouts(path, kinds=("3連単",), columns=columns, is_odds=is_odds)
 
 
 def synthetic_payout_from_odds(df: pd.DataFrame, pred_free: bool = True) -> pd.DataFrame:

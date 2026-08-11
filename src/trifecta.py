@@ -48,35 +48,77 @@ BET_UNIT = 100  # 1点100円
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Strategy:
-    """3連単の買い方。上位 n1/n2/n3 頭から1着/2着/3着を選ぶ。"""
+    """買い方。上位 n1/n2/n3 頭から1着/2着/3着を選ぶ。
+
+    kind="3連単" なら着順どおりに当てる必要がある。
+    kind="3連複" は着順不問なので、n1=n2=n3=k の BOX としてだけ使う。
+    """
 
     name: str
     n1: int
     n2: int
     n3: int
+    kind: str = "3連単"
 
     @property
     def points(self) -> int:
         """点数（出走頭数が足りている場合）。"""
+        if self.kind == "3連複":
+            k = self.n3
+            return max(k * (k - 1) * (k - 2) // 6, 0)  # C(k,3)
         return max(self.n1 * (self.n2 - 1) * (self.n3 - 2), 0)
+
+    @property
+    def payout_column(self) -> str:
+        return f"{self.kind}払戻"
 
 
 def box(k: int) -> Strategy:
-    """上位k頭のBOX買い。"""
+    """3連単・上位k頭のBOX買い（k(k-1)(k-2) 点）。"""
     return Strategy(f"上位{k}頭BOX", k, k, k)
 
 
 def formation(n1: int, n2: int, n3: int) -> Strategy:
-    """フォーメーション（1着候補n1頭・2着候補n2頭・3着候補n3頭）。"""
+    """3連単フォーメーション（1着候補n1頭・2着候補n2頭・3着候補n3頭）。"""
     return Strategy(f"F{n1}→{n2}→{n3}", n1, n2, n3)
 
 
-# 標準の比較セット（進捗まとめ 3.3 の表に対応）
+def trio(k: int) -> Strategy:
+    """3連複・上位k頭のBOX買い（C(k,3) 点）。
+
+    着順を問わないので、上位k頭の中に1〜3着が全部入っていれば的中。
+    3連単の同じk頭BOXと比べて点数が 1/6 になり的中率は6倍になる。
+    その代わり配当は下がるので、「熱い基準」を満たせるかが焦点。
+    """
+    return Strategy(f"3連複{k}頭BOX", k, k, k, kind="3連複")
+
+
+def multi2(n3: int) -> Strategy:
+    """軸2頭マルチ（1着・2着を上位2頭で入れ替え、3着は上位n3頭）。
+
+    入れ子フォーメーションの n1=n2=2 と同じ形。点数は 2×1×(n3-2)。
+    """
+    return Strategy(f"軸2頭マルチ→{n3}", 2, 2, n3)
+
+
+# v2 までの比較セット（進捗まとめ 3.3 の表に対応）
 DEFAULT_STRATEGIES = [
     formation(1, 3, 4), box(3), formation(1, 4, 6), formation(1, 4, 8),
     box(4), formation(2, 5, 6), formation(2, 5, 8), box(5),
     formation(2, 6, 10), box(6),
 ]
+
+# v3 依頼Dで追加した買い方
+EXTRA_STRATEGIES = [
+    box(7), box(8),
+    formation(1, 5, 8), formation(1, 5, 10), formation(2, 4, 8),
+    formation(3, 5, 8), formation(3, 6, 8),
+    multi2(8), multi2(10),
+    trio(4), trio(5), trio(6), trio(7), trio(8),
+]
+
+# 総当たり用（v2 + v3）
+ALL_STRATEGIES = DEFAULT_STRATEGIES + EXTRA_STRATEGIES
 
 
 # ---------------------------------------------------------------------------
@@ -168,10 +210,11 @@ def build_race_table(df: pd.DataFrame, pred: np.ndarray | pd.Series,
         race["重賞"] = False
 
     if payout_df is not None:
+        # 3連単払戻・3連複払戻など、渡された払戻列をまとめて貼る
         pay = payout_df.rename(columns={"レースID": "_pid"})
         race = race.merge(pay, left_on="レースID", right_on="_pid", how="left")
         race = race.drop(columns=[c for c in ["_pid"] if c in race.columns])
-    else:
+    if "3連単払戻" not in race.columns:
         race["3連単払戻"] = np.nan
 
     # 3着まで揃っていないレース（出走3頭未満・同着で欠けるなど）は検証対象外
@@ -183,33 +226,47 @@ def build_race_table(df: pd.DataFrame, pred: np.ndarray | pd.Series,
 # シミュレーション
 # ---------------------------------------------------------------------------
 def simulate(race: pd.DataFrame, strategy: Strategy,
-             require_payout: bool = True) -> dict:
-    """1つの買い方について成績を計算する。"""
+             require_payout: bool = True,
+             threshold: float | None = None) -> dict:
+    """1つの買い方について成績を計算する。
+
+    threshold を渡すと「熱い」基準額を上書きできる（依頼Cの感度分析用）。
+    省略時は投資額から自動で決まる。
+    """
+    pay_col = strategy.payout_column
     r = race
+    if pay_col not in r.columns:
+        return {"買い方": strategy.name, "レース数": 0, "券種": strategy.kind}
     if require_payout:
-        r = r.loc[r["3連単払戻"].notna()]
+        r = r.loc[r[pay_col].notna()]
     if r.empty:
-        return {"買い方": strategy.name, "レース数": 0}
+        return {"買い方": strategy.name, "レース数": 0, "券種": strategy.kind}
 
     m = r["出走頭数"].to_numpy()
     # 出走頭数が候補数に満たない場合は、実際に買える点数まで縮める
     n1 = np.minimum(strategy.n1, m)
     n2 = np.minimum(strategy.n2, m)
     n3 = np.minimum(strategy.n3, m)
-    points = np.clip(n1 * (n2 - 1) * (n3 - 2), 0, None)
 
-    hit = (
-        (r["1着予測順位"].to_numpy() <= n1)
-        & (r["2着予測順位"].to_numpy() <= n2)
-        & (r["3着予測順位"].to_numpy() <= n3)
-    )
+    r1 = r["1着予測順位"].to_numpy()
+    r2 = r["2着予測順位"].to_numpy()
+    r3 = r["3着予測順位"].to_numpy()
+
+    if strategy.kind == "3連複":
+        # 着順不問。上位k頭の中に1〜3着が全部入っていれば的中
+        k = n3
+        points = np.clip(k * (k - 1) * (k - 2) // 6, 0, None)
+        hit = (r1 <= k) & (r2 <= k) & (r3 <= k)
+    else:
+        points = np.clip(n1 * (n2 - 1) * (n3 - 2), 0, None)
+        hit = (r1 <= n1) & (r2 <= n2) & (r3 <= n3)
 
     invest = points * BET_UNIT
-    payout = np.where(hit, r["3連単払戻"].to_numpy(), 0.0)
+    payout = np.where(hit, r[pay_col].to_numpy(), 0.0)
 
     # 「熱い」基準はその買い方の1レースあたり投資額で決まる
     typical_invest = float(np.median(invest))
-    threshold = hot_threshold(typical_invest)
+    threshold = hot_threshold(typical_invest) if threshold is None else float(threshold)
     hot = payout >= threshold
 
     n_races = len(r)
@@ -220,6 +277,7 @@ def simulate(race: pd.DataFrame, strategy: Strategy,
     hit_payouts = payout[hit]
     return {
         "買い方": strategy.name,
+        "券種": strategy.kind,
         "点数": int(np.median(points)),
         "投資/R": int(typical_invest),
         "レース数": n_races,
@@ -395,10 +453,25 @@ def verdict(auc: float | None, table: pd.DataFrame, gap_result: dict) -> pd.Data
     return out
 
 
+def _is_rate_column(col: str) -> bool:
+    """パーセント表記にすべき列か。
+
+    「倍率」は割合ではなく倍数なので除外する。
+    「指標下限/指標上限」のような層の境界値もそのまま表示したいので、
+    率の信頼区間だけを名前で拾う。
+    """
+    if col in ("倍率", "残す割合"):
+        return False
+    if col in ("達成率下限", "達成率上限"):
+        return True
+    return col.endswith("率") or col.endswith("率差")
+
+
 def format_table(table: pd.DataFrame) -> pd.DataFrame:
     """パーセント表記に整えて見やすくする（表示用）。"""
     out = table.copy()
     for col in out.columns:
-        if any(k in col for k in ("率", "下限", "上限")):
-            out[col] = (out[col] * 100).round(3)
+        base = col.split("_")[0]  # 「達成率_重賞」のような接尾辞つきに対応
+        if _is_rate_column(col) or _is_rate_column(base):
+            out[col] = (pd.to_numeric(out[col], errors="coerce") * 100).round(3)
     return out

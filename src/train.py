@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 from . import (betting, config, corner, evaluate, features, pace, payout,
-               preprocess, trifecta)
+               preprocess, selection, trifecta)
 
 
 @dataclass
@@ -37,6 +37,7 @@ class PipelineResult:
     graded_vs_flat: pd.DataFrame | None = None  # 重賞 vs 平場
     gap_result: dict | None = None              # 乖離ベースの成績
     verdict: pd.DataFrame | None = None         # v2ベースラインとの比較
+    v3: dict | None = None                      # v3のレース選別分析（依頼A〜D）
 
 
 def train_lgb(train_df: pd.DataFrame, valid_df: pd.DataFrame, feature_cols: list[str],
@@ -82,6 +83,7 @@ def run_pipeline(csv_path: str | None = None, df: pd.DataFrame | None = None,
                  corner_df: pd.DataFrame | None = None,
                  lap_df: pd.DataFrame | None = None,
                  payout_df: pd.DataFrame | None = None,
+                 run_v3: bool = True,
                  verbose: bool = True) -> PipelineResult:
     """CSV から評価まで一気通貫で実行する。
 
@@ -93,7 +95,9 @@ def run_pipeline(csv_path: str | None = None, df: pd.DataFrame | None = None,
                    特徴量は絞る前の全期間から計算するので通算成績は壊れない。
     corner_path  : corner_passing_order.csv のパス。渡すと脚質特徴量（依頼A）が入る。
     lap_path     : laptime.csv のパス。渡すとペース特徴量（依頼B）が入る。
-    odds_path    : odds.csv のパス。渡すと3連単の買い方検証（依頼C）まで実行する。
+    odds_path    : odds.csv のパス。渡すと3連単の買い方検証（v2依頼C）まで実行する。
+    run_v3       : True なら v3 のレース選別分析（難易度指標・層別・スイープ・
+                   グレード別・基準額の感度）まで実行する。
     """
     def log(msg: str) -> None:
         if verbose:
@@ -117,9 +121,10 @@ def run_pipeline(csv_path: str | None = None, df: pd.DataFrame | None = None,
         lap_df = pace.load_laptime(lap_path)
         log(f"      {len(lap_df):,} レース分")
     if payout_df is None and odds_path is not None:
-        log("      3連単配当を読み込み中...")
-        payout_df = payout.load_trifecta_payout(odds_path)
-        log(f"      {len(payout_df):,} レース分")
+        log("      配当（3連単・3連複）を読み込み中...")
+        payout_df = payout.load_payouts(odds_path)
+        kinds = [c for c in payout_df.columns if c != "レースID"]
+        log(f"      {len(payout_df):,} レース分 / {kinds}")
 
     log("[3/6] 特徴量作成...")
     df = features.add_all_features(df, strict_daily_lag=strict_daily_lag,
@@ -155,7 +160,7 @@ def run_pipeline(csv_path: str | None = None, df: pd.DataFrame | None = None,
 
     # --- 依頼C：3連単の買い方検証 -------------------------------------------
     race_table = strategy_all = strategy_graded = graded_vs_flat = None
-    gap_result = verdict_table = None
+    gap_result = verdict_table = v3 = None
     if payout_df is not None:
         log("      3連単の買い方を総当たり...")
         race_table = trifecta.build_race_table(test_df, pred, payout_df)
@@ -168,6 +173,11 @@ def run_pipeline(csv_path: str | None = None, df: pd.DataFrame | None = None,
             strategy_graded = trifecta.strategy_table(race_table, graded_only=True)
             graded_vs_flat = trifecta.compare_graded_vs_flat(race_table)
         log(f"      検証レース数 {len(race_table):,}（うち重賞 {n_graded:,}）")
+
+        # --- v3：レース選別・グレード別・基準額の感度（依頼A〜D）------------
+        if run_v3 and n_graded > 0:
+            log("      v3：レース選別を分析中...")
+            v3 = selection.run_v3_analysis(race_table, test_df, pred, verbose=False)
 
     if verbose:
         print("\n--- gain 重要度 上位15 ---")
@@ -194,6 +204,12 @@ def run_pipeline(csv_path: str | None = None, df: pd.DataFrame | None = None,
         if verdict_table is not None:
             print("\n--- v2ベースラインとの比較（依頼書セクション6） ---")
             print(verdict_table.to_string(index=False))
+        if v3 is not None:
+            selection._print_v3(v3)
+            best = selection.best_candidates(v3)
+            print("\n=== v3 成功判定：達成率の信頼区間下限が10%を超えた条件 ===")
+            print(best.to_string(index=False) if not best.empty
+                  else "  見つからなかった（下限10%を超える条件なし）")
 
     return PipelineResult(
         model=model, train_df=train_df, test_df=test_df, pred=pred,
@@ -201,5 +217,5 @@ def run_pipeline(csv_path: str | None = None, df: pd.DataFrame | None = None,
         topn_report=topn, ev_report=ev, high_odds_report=high,
         auc=auc, race_table=race_table, strategy_all=strategy_all,
         strategy_graded=strategy_graded, graded_vs_flat=graded_vs_flat,
-        gap_result=gap_result, verdict=verdict_table,
+        gap_result=gap_result, verdict=verdict_table, v3=v3,
     )
