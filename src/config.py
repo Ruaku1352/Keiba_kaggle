@@ -11,8 +11,11 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # パス（Colab を想定。ローカルで動かすときは書き換える）
 # ---------------------------------------------------------------------------
-DATA_DIR = "/content/drive/MyDrive/keiba"
+DATA_DIR = "/content/drive/MyDrive"
 RACE_RESULT_CSV = f"{DATA_DIR}/race_result.csv"
+ODDS_CSV = f"{DATA_DIR}/19860105-20210731_odds.csv"
+LAPTIME_CSV = f"{DATA_DIR}/19860105-20210731_laptime.csv"
+CORNER_CSV = f"{DATA_DIR}/20020615-20210731_corner_passing_order.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +43,19 @@ COLUMN_CANDIDATES: dict[str, list[str]] = {
     "popularity": ["人気", "確定単勝人気順位"],
     "time": ["タイム", "走破タイム"],
     "last3f": ["後３Ｆタイム", "上がり3ハロン", "後3Fタイム"],
+    "grade": ["リステッド・重賞競走", "重賞コード", "グレード"],
+    "race_name": ["競走名", "レース名", "競走名略称"],
+}
+
+# 重賞とみなす格付け（NaN は平場）
+GRADED_VALUES = ("G1", "G2", "G3", "G")
+
+# 「熱い」の定義：予算 -> 目標払戻（開発者の設定した基準）
+HOT_CRITERIA = {
+    1000: 10_000,
+    3000: 20_000,
+    5000: 30_000,
+    10000: 50_000,
 }
 
 # 目的変数の名前

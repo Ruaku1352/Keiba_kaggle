@@ -31,56 +31,17 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from . import config
+from . import config, leakfree
 
 
 # ---------------------------------------------------------------------------
-# 低レベルのヘルパー
+# 低レベルのヘルパー（実体は leakfree.py。ここでは短い別名を張るだけ）
 # ---------------------------------------------------------------------------
-def _past_count(df: pd.DataFrame, keys: list[str]) -> pd.Series:
-    """自分より前に、そのキーで何行あったか（＝過去出走回数）。"""
-    return df.groupby(keys, observed=True, sort=False).cumcount()
-
-
-def _past_sum(df: pd.DataFrame, keys: list[str], value: pd.Series) -> pd.Series:
-    """自分より前の合計（自分自身は含まない）。"""
-    tmp = value.fillna(0)
-    cum = tmp.groupby([df[k] for k in keys], observed=True, sort=False).cumsum()
-    return cum - tmp
-
-
-def _past_rate(df: pd.DataFrame, keys: list[str], value: pd.Series,
-               min_count: int = 1) -> pd.Series:
-    """自分より前の平均（＝勝率など）。母数が min_count 未満なら NaN。"""
-    cnt = _past_count(df, keys)
-    tot = _past_sum(df, keys, value)
-    rate = tot / cnt.replace(0, np.nan)
-    return rate.where(cnt >= min_count)
-
-
-def _past_window_mean(df: pd.DataFrame, keys: list[str], value: pd.Series,
-                      window: int) -> pd.Series:
-    """直近 window 走の平均（自分自身は含まない）。
-
-    累積和の差分で計算するので O(n)。groupby.rolling より桁違いに速い。
-    """
-    tmp = value.fillna(0)
-    grouper = [df[k] for k in keys]
-    past_cum = tmp.groupby(grouper, observed=True, sort=False).cumsum() - tmp
-    # window 行前の時点での「過去累積和」
-    lagged = past_cum.groupby(grouper, observed=True, sort=False).shift(window).fillna(0)
-
-    cnt = _past_count(df, keys)
-    denom = np.minimum(cnt, window)  # 出走数が window に満たない馬に対応
-    win_sum = past_cum - lagged
-    return (win_sum / denom.replace(0, np.nan)).astype("float32")
-
-
-def _label_encode(s: pd.Series) -> pd.Series:
-    """groupby キー用に文字列/カテゴリを整数コード化する（速度・メモリ対策）。"""
-    if isinstance(s.dtype, pd.CategoricalDtype):
-        return s.cat.codes
-    return s.astype("category").cat.codes
+_past_count = leakfree.past_count
+_past_sum = leakfree.past_sum
+_past_rate = leakfree.past_rate
+_past_window_mean = leakfree.past_window_mean
+_label_encode = leakfree.label_encode
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +250,9 @@ def add_race_features(df: pd.DataFrame) -> pd.DataFrame:
 # まとめて実行
 # ---------------------------------------------------------------------------
 def add_all_features(df: pd.DataFrame, strict_daily_lag: bool = False,
-                     drop_helper_cols: bool = True) -> pd.DataFrame:
+                     drop_helper_cols: bool = True,
+                     corner_df: pd.DataFrame | None = None,
+                     lap_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """すべての特徴量を追加する（この関数だけ呼べばよい）。
 
     Parameters
@@ -297,8 +260,16 @@ def add_all_features(df: pd.DataFrame, strict_daily_lag: bool = False,
     strict_daily_lag :
         True なら騎手・調教師の勝率を「前日終了時点」で計算する（より厳密）。
     drop_helper_cols :
-        True なら内部用の `_xxx_code` 列を最後に削除する。
+        True なら内部用の作業列（`_` で始まる列）を最後に削除する。
+    corner_df :
+        corner.load_corner() の戻り値。渡すと脚質・展開特徴量（依頼A）が付く。
+    lap_df :
+        pace.load_laptime() の戻り値。渡すとペース特徴量（依頼B）が付く。
+        脚質特徴量が先に付いていると「想定ペース」も作れる。
     """
+    from . import corner as corner_mod  # 循環 import を避けるため関数内で読む
+    from . import pace as pace_mod
+
     df = df.copy()
 
     df = add_horse_features(df)
@@ -307,8 +278,20 @@ def add_all_features(df: pd.DataFrame, strict_daily_lag: bool = False,
     df = add_horse_jockey_features(df)
     df = add_race_features(df)
 
+    # 依頼A：脚質・展開（ペースの想定に使うので先に計算する）
+    if corner_df is not None:
+        df = corner_mod.attach_corner_position(df, corner_df)
+        df = corner_mod.add_running_style_features(df)
+
+    # 依頼B：ペース
+    if lap_df is not None:
+        df = pace_mod.attach_race_pace(df, lap_df)
+        df = pace_mod.add_pace_features(df)
+
     if drop_helper_cols:
-        helper = [c for c in df.columns if c.startswith("_") and c.endswith("_code")]
+        # `_` で始まる列は「そのレースの結果」や中間計算なので、
+        # 特徴量に紛れ込まないようここで一括削除する。
+        helper = [c for c in df.columns if c.startswith("_")]
         df = df.drop(columns=helper)
 
     return df
@@ -342,6 +325,12 @@ def feature_columns(df: pd.DataFrame, include_odds: bool = False) -> list[str]:
         "出走頭数", "通算勝率_レース内順位", "騎手勝率_レース内順位", "斤量_レース内平均差",
     ]
     engineered += [f"過去{n}走平均着順" for n in config.RECENT_WINDOWS]
+
+    # 依頼A・Bの特徴量（データを渡していれば列が存在する）
+    from . import corner as corner_mod
+    from . import pace as pace_mod
+    engineered += corner_mod.running_style_feature_columns()
+    engineered += pace_mod.pace_feature_columns()
 
     result = [cols[k] for k in base_logical if k in cols]
     result += [c for c in engineered if c in df.columns]
