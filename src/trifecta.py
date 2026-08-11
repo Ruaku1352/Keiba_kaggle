@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -151,6 +152,44 @@ def wilson_interval(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
     center = (p + z**2 / (2 * n)) / denom
     margin = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / denom
     return (max(0.0, center - margin), min(1.0, center + margin))
+
+
+def _normal_cdf(x: float) -> float:
+    """標準正規分布の累積分布関数（scipy を使わずに済ませるため）。"""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def two_proportion_test(hits_a: int, n_a: int, hits_b: int, n_b: int) -> dict:
+    """2つの割合の差の検定（両側 z 検定）＋ Newcombe 法による差の信頼区間。
+
+    「重賞と平場で達成率が違う」を言うために使う。
+
+    信頼区間が重ならないことは差があることの**十分条件だが必要条件ではない**。
+    つまり区間の重なりだけで判定すると、本当は差があるケースを見逃す。
+    差そのものを検定した方が検出力が高いので、こちらを主に使う。
+
+    差の区間には Newcombe のスコア法を使う。個々の Wilson 区間から組み立てるので、
+    達成率が数%と0に近い状況でも下限が負に飛び出しにくい。
+    """
+    if n_a == 0 or n_b == 0:
+        return {"差": float("nan"), "z": float("nan"), "p値": float("nan"),
+                "差下限": float("nan"), "差上限": float("nan"), "有意": False}
+
+    p_a, p_b = hits_a / n_a, hits_b / n_b
+    # プール比率で標準誤差を作る（帰無仮説「両者は同じ割合」のもとでの検定）
+    p_pool = (hits_a + hits_b) / (n_a + n_b)
+    se = math.sqrt(p_pool * (1 - p_pool) * (1 / n_a + 1 / n_b))
+    z = (p_a - p_b) / se if se > 0 else 0.0
+    p_value = 2 * (1 - _normal_cdf(abs(z)))
+
+    # Newcombe: 各群の Wilson 区間 [l, u] を使って差の区間を作る
+    l_a, u_a = wilson_interval(hits_a, n_a)
+    l_b, u_b = wilson_interval(hits_b, n_b)
+    lower = (p_a - p_b) - math.sqrt((p_a - l_a) ** 2 + (u_b - p_b) ** 2)
+    upper = (p_a - p_b) + math.sqrt((u_a - p_a) ** 2 + (p_b - l_b) ** 2)
+
+    return {"差": p_a - p_b, "z": z, "p値": p_value,
+            "差下限": lower, "差上限": upper, "有意": bool(p_value < 0.05)}
 
 
 def normal_interval(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
